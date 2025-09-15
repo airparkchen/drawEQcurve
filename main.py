@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # ================================================================================
 # 頻率響應曲線編輯器 - 修正版本
-# 解決 AttributeError: 'FrequencyPlotWidget' object has no attribute 'import_requested'
+# 完整實現三曲線計算：耳機響應 + EQ調整 = 目標曲線
+# 每條曲線都有匯入/匯出按鈕
 # ================================================================================
 
 import sys
@@ -13,6 +14,9 @@ from PyQt5.QtCore import Qt, pyqtSignal, QObject, QDateTime
 from PyQt5.QtGui import QFont, QMouseEvent
 import pyqtgraph as pg
 from scipy.interpolate import interp1d
+
+# 導入計算服務
+from calculation_service import CurveCalculator
 
 # ================================================================================
 # 1. 數據處理工具 (FrequencyResponseData)
@@ -75,15 +79,34 @@ class FrequencyResponseData(QObject):
             return False
 
     def save_to_file(self, file_path):
-        """將數據存檔到文字檔案"""
+        """將數據存檔到 FilterCurve 格式"""
         try:
-            # 簡單的頻率/增益格式
             with open(file_path, 'w', encoding='utf-8') as f:
-                f.write("# Frequency (Hz), Gain (dB)\n")
-                for freq, gain in zip(self.frequencies, self.gains):
-                    f.write(f"{freq:.2f}\t{gain:+.2f}\n")
+                if len(self.frequencies) == 0:
+                    return False
+                
+                # 構建 FilterCurve 格式字符串
+                freq_parts = []
+                gain_parts = []
+                
+                for i, (freq, gain) in enumerate(zip(self.frequencies, self.gains)):
+                    freq_parts.append(f'f{i}="{freq}"')
+                    gain_parts.append(f'v{i}="{gain}"')
+                
+                # 組合成完整的 FilterCurve 字符串
+                freq_string = ' '.join(freq_parts)
+                gain_string = ' '.join(gain_parts)
+                
+                filter_curve = (
+                    f'FilterCurve:{freq_string} '
+                    f'FilterLength="8191" InterpolateLin="0" InterpolationMethod="B-spline" '
+                    f'{gain_string}'
+                )
+                
+                f.write(filter_curve)
             return True
-        except Exception:
+        except Exception as e:
+            print(f"儲存檔案錯誤: {e}")
             return False
 
     def update_gain_at_index(self, index, new_gain):
@@ -124,80 +147,7 @@ class FrequencyResponseData(QObject):
         self.data_changed.emit()
 
 # ================================================================================
-# 2. 曲線計算服務 (CurveCalculator)
-# ================================================================================
-
-class CurveCalculator:
-    """處理曲線間的數學運算"""
-    
-    @staticmethod
-    def align_frequencies(curve1, curve2):
-        """對齊兩條曲線的頻率網格"""
-        if len(curve1.frequencies) == 0 or len(curve2.frequencies) == 0:
-            return None
-        
-        min_freq = min(curve1.frequencies[0], curve2.frequencies[0])
-        max_freq = max(curve1.frequencies[-1], curve2.frequencies[-1])
-        
-        num_points = 200
-        frequencies = np.logspace(np.log10(min_freq), np.log10(max_freq), num_points)
-        
-        return frequencies
-    
-    @staticmethod
-    def interpolate_curve(curve, target_frequencies):
-        """將曲線插值到目標頻率"""
-        if len(curve.frequencies) == 0:
-            return np.zeros_like(target_frequencies)
-        
-        try:
-            gains = np.interp(target_frequencies, curve.frequencies, curve.gains)
-            return gains
-        except Exception:
-            return np.zeros_like(target_frequencies)
-    
-    @staticmethod
-    def add_curves(curve1, curve2):
-        """兩條曲線相加：curve1 + curve2"""
-        try:
-            frequencies = CurveCalculator.align_frequencies(curve1, curve2)
-            if frequencies is None:
-                return None
-            
-            gains1 = CurveCalculator.interpolate_curve(curve1, frequencies)
-            gains2 = CurveCalculator.interpolate_curve(curve2, frequencies)
-            
-            result_gains = gains1 + gains2
-            
-            return {
-                'frequencies': frequencies,
-                'gains': result_gains
-            }
-        except Exception:
-            return None
-    
-    @staticmethod
-    def subtract_curves(curve1, curve2):
-        """兩條曲線相減：curve1 - curve2"""
-        try:
-            frequencies = CurveCalculator.align_frequencies(curve1, curve2)
-            if frequencies is None:
-                return None
-            
-            gains1 = CurveCalculator.interpolate_curve(curve1, frequencies)
-            gains2 = CurveCalculator.interpolate_curve(curve2, frequencies)
-            
-            result_gains = gains1 - gains2
-            
-            return {
-                'frequencies': frequencies,
-                'gains': result_gains
-            }
-        except Exception:
-            return None
-
-# ================================================================================
-# 3. 多曲線管理器 (MultiCurveManager)
+# 2. 多曲線管理器 (MultiCurveManager)
 # ================================================================================
 
 class MultiCurveManager(QObject):
@@ -234,44 +184,94 @@ class MultiCurveManager(QObject):
         """當任一曲線數據改變時被呼叫"""
         self.last_modified = f"{curve_type} at {QDateTime.currentDateTime().toString('hh:mm:ss')}"
         if self.auto_calculate:
-            self.calculate_eq() # 簡化為只計算 EQ
+            self.auto_calculate_missing_curve()
         self.curves_changed.emit()
 
-    def calculate_eq(self):
-        """計算 EQ 調整曲線 (目標 - 耳機)"""
-        if len(self.headphone_curve.frequencies) == 0 or len(self.target_curve.frequencies) == 0:
-            return
+    def auto_calculate_missing_curve(self):
+        """自動計算缺失的曲線"""
+        # 檢查哪些曲線有數據
+        has_headphone = len(self.headphone_curve.frequencies) > 0
+        has_eq = len(self.eq_curve.frequencies) > 0
+        has_target = len(self.target_curve.frequencies) > 0
         
-        result = CurveCalculator.subtract_curves(self.target_curve, self.headphone_curve)
-        if result:
-            self.eq_curve.frequencies = result['frequencies']
-            self.eq_curve.gains = result['gains']
-            self.eq_curve.is_interpolated = False
-            self.calculation_done.emit()
-            
-    def calculate_headphone(self):
-        """計算耳機響應曲線 (EQ + 目標)"""
-        if len(self.eq_curve.frequencies) == 0 or len(self.target_curve.frequencies) == 0:
-            return
-            
-        result = CurveCalculator.subtract_curves(self.target_curve, self.eq_curve)
-        if result:
-            self.headphone_curve.frequencies = result['frequencies']
-            self.headphone_curve.gains = result['gains']
-            self.headphone_curve.is_interpolated = False
-            self.calculation_done.emit()
-    
-    def calculate_target(self):
-        """計算目標曲線 (耳機 - EQ)"""
+        # 根據情況計算缺失的曲線
+        if has_headphone and has_eq and not has_target:
+            # 耳機響應 + EQ調整 = 目標
+            self.calculate_target_from_headphone_eq()
+        elif has_target and has_headphone and not has_eq:
+            # 目標 - 耳機響應 = EQ調整
+            self.calculate_eq_from_target_headphone()
+        elif has_target and has_eq and not has_headphone:
+            # 目標 - EQ調整 = 耳機響應
+            self.calculate_headphone_from_target_eq()
+
+    def calculate_target_from_headphone_eq(self):
+        """計算目標曲線：耳機響應 + EQ調整 = 目標"""
         if len(self.headphone_curve.frequencies) == 0 or len(self.eq_curve.frequencies) == 0:
             return
         
-        result = CurveCalculator.subtract_curves(self.headphone_curve, self.eq_curve)
+        result = CurveCalculator.calculate_target_from_headphone_eq(self.headphone_curve, self.eq_curve)
         if result:
+            # 暫時關閉自動計算避免循環
+            old_auto = self.auto_calculate
+            self.auto_calculate = False
+            
             self.target_curve.frequencies = result['frequencies']
             self.target_curve.gains = result['gains']
             self.target_curve.is_interpolated = False
+            self.target_curve.interpolate()
+            
+            self.auto_calculate = old_auto
             self.calculation_done.emit()
+            
+    def calculate_eq_from_target_headphone(self):
+        """計算EQ調整：目標 - 耳機響應 = EQ調整"""
+        if len(self.target_curve.frequencies) == 0 or len(self.headphone_curve.frequencies) == 0:
+            return
+        
+        result = CurveCalculator.calculate_eq_from_target_headphone(self.target_curve, self.headphone_curve)
+        if result:
+            old_auto = self.auto_calculate
+            self.auto_calculate = False
+            
+            self.eq_curve.frequencies = result['frequencies']
+            self.eq_curve.gains = result['gains']
+            self.eq_curve.is_interpolated = False
+            self.eq_curve.interpolate()
+            
+            self.auto_calculate = old_auto
+            self.calculation_done.emit()
+    
+    def calculate_headphone_from_target_eq(self):
+        """計算耳機響應：目標 - EQ調整 = 耳機響應"""
+        if len(self.target_curve.frequencies) == 0 or len(self.eq_curve.frequencies) == 0:
+            return
+        
+        result = CurveCalculator.calculate_headphone_from_target_eq(self.target_curve, self.eq_curve)
+        if result:
+            old_auto = self.auto_calculate
+            self.auto_calculate = False
+            
+            self.headphone_curve.frequencies = result['frequencies']
+            self.headphone_curve.gains = result['gains']
+            self.headphone_curve.is_interpolated = False
+            self.headphone_curve.interpolate()
+            
+            self.auto_calculate = old_auto
+            self.calculation_done.emit()
+
+    # 保留手動計算方法供按鈕使用
+    def calculate_target(self):
+        """手動計算目標曲線"""
+        self.calculate_target_from_headphone_eq()
+    
+    def calculate_eq(self):
+        """手動計算EQ調整"""
+        self.calculate_eq_from_target_headphone()
+    
+    def calculate_headphone(self):
+        """手動計算耳機響應"""
+        self.calculate_headphone_from_target_eq()
 
     def load_preset_target(self, preset_type):
         """載入預設目標曲線"""
@@ -308,13 +308,15 @@ class MultiCurveManager(QObject):
         }
 
 # ================================================================================
-# 4. 繪圖組件 (FrequencyPlotWidget)
+# 3. 繪圖組件 (FrequencyPlotWidget)
 # ================================================================================
 
 class FrequencyPlotWidget(QWidget):
     """頻率響應繪圖組件（修正自原版）"""
     
     point_selected = pyqtSignal(int)
+    import_requested = pyqtSignal()  # 新增匯入信號
+    export_requested = pyqtSignal()  # 新增匯出信號
     
     def __init__(self, data, title="頻率響應", color='#2196F3'):
         super().__init__()
@@ -334,10 +336,55 @@ class FrequencyPlotWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         
+        # 標題和按鈕行
+        header_layout = QHBoxLayout()
+        
         title_label = QLabel(self.title)
         title_label.setFont(QFont("Arial", 11, QFont.Bold))
         title_label.setStyleSheet(f"color: {self.color}; padding: 5px;")
-        layout.addWidget(title_label)
+        header_layout.addWidget(title_label)
+        
+        header_layout.addStretch()  # 推向右側
+        
+        # 匯入按鈕
+        import_btn = QPushButton("匯入")
+        import_btn.setMaximumSize(60, 25)
+        import_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                border-radius: 3px;
+                font-size: 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        import_btn.clicked.connect(self.import_requested.emit)
+        header_layout.addWidget(import_btn)
+        
+        # 匯出按鈕
+        export_btn = QPushButton("匯出")
+        export_btn.setMaximumSize(60, 25)
+        export_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                border: none;
+                border-radius: 3px;
+                font-size: 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+        """)
+        export_btn.clicked.connect(self.export_requested.emit)
+        header_layout.addWidget(export_btn)
+        
+        layout.addLayout(header_layout)
         
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground('w')
@@ -493,7 +540,7 @@ class FrequencyPlotWidget(QWidget):
         self.update_plot()
 
 # ================================================================================
-# 5. 控制面板 (ControlPanel)
+# 4. 控制面板 (ControlPanel)
 # ================================================================================
 
 class ControlPanel(QWidget):
@@ -520,7 +567,7 @@ class ControlPanel(QWidget):
         self.auto_calc_cb.toggled.connect(self.on_auto_calc_changed)
         calc_layout.addWidget(self.auto_calc_cb)
         
-        calc_target_btn = QPushButton("計算目標曲線 (耳機-EQ)")
+        calc_target_btn = QPushButton("計算目標曲線 (耳機+EQ)")
         calc_target_btn.clicked.connect(lambda: self.manager.calculate_target())
         calc_layout.addWidget(calc_target_btn)
         
@@ -528,7 +575,7 @@ class ControlPanel(QWidget):
         calc_eq_btn.clicked.connect(lambda: self.manager.calculate_eq())
         calc_layout.addWidget(calc_eq_btn)
         
-        calc_headphone_btn = QPushButton("計算耳機響應 (目標+EQ)")
+        calc_headphone_btn = QPushButton("計算耳機響應 (目標-EQ)")
         calc_headphone_btn.clicked.connect(lambda: self.manager.calculate_headphone())
         calc_layout.addWidget(calc_headphone_btn)
         
@@ -609,7 +656,7 @@ class ControlPanel(QWidget):
         self.info_text.setText("\n".join(info))
 
 # ================================================================================
-# 6. 主視窗 (FrequencyResponseEditor)
+# 5. 主視窗 (FrequencyResponseEditor)
 # ================================================================================
 
 class FrequencyResponseEditor(QMainWindow):
@@ -706,6 +753,14 @@ class FrequencyResponseEditor(QMainWindow):
         self.eq_plot.point_selected.connect(lambda idx: self.on_point_selected(idx, 'eq'))
         self.target_plot.point_selected.connect(lambda idx: self.on_point_selected(idx, 'target'))
         
+        # 連接匯入匯出按鈕信號
+        self.headphone_plot.import_requested.connect(lambda: self.import_file('headphone'))
+        self.headphone_plot.export_requested.connect(lambda: self.export_file('headphone'))
+        self.eq_plot.import_requested.connect(lambda: self.import_file('eq'))
+        self.eq_plot.export_requested.connect(lambda: self.export_file('eq'))
+        self.target_plot.import_requested.connect(lambda: self.import_file('target'))
+        self.target_plot.export_requested.connect(lambda: self.export_file('target'))
+        
         self.control_panel.display_changed.connect(self.update_all_displays)
         self.curve_manager.curves_changed.connect(self.update_all_plots)
         self.curve_manager.calculation_done.connect(self.update_all_plots)
@@ -725,6 +780,9 @@ class FrequencyResponseEditor(QMainWindow):
     def on_point_selected(self, index, curve_type):
         """點被選中"""
         curve = self.curve_manager.get_curve(curve_type)
+    def on_point_selected(self, index, curve_type):
+        """點被選中"""
+        curve = self.curve_manager.get_curve(curve_type)
         if len(curve.frequencies) > index:
             freq = curve.frequencies[index]
             gain = curve.gains[index]
@@ -733,7 +791,10 @@ class FrequencyResponseEditor(QMainWindow):
     def import_file(self, curve_type):
         """匯入檔案功能"""
         curve_names = {'headphone': '耳機響應曲線', 'eq': 'EQ調整曲線', 'target': '目標曲線'}
-        file_path, _ = QFileDialog.getOpenFileName(self, f"匯入{curve_names[curve_type]}", "", "文字檔案 (*.txt);;所有檔案 (*.*)")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, f"匯入{curve_names[curve_type]}", "", 
+            "文字檔案 (*.txt);;所有檔案 (*.*)"
+        )
         
         if file_path:
             try:
@@ -743,7 +804,9 @@ class FrequencyResponseEditor(QMainWindow):
                 curve = self.curve_manager.get_curve(curve_type)
                 if curve.parse_content(content):
                     curve.filename = os.path.basename(file_path)
-                    self.statusBar().showMessage(f"已匯入{curve_names[curve_type]}: {curve.filename}", 3000)
+                    self.statusBar().showMessage(
+                        f"已匯入{curve_names[curve_type]}: {curve.filename}", 3000
+                    )
                 else:
                     QMessageBox.critical(self, "錯誤", "無法解析檔案格式")
             except Exception as e:
@@ -757,12 +820,18 @@ class FrequencyResponseEditor(QMainWindow):
             QMessageBox.warning(self, "警告", f"{curve_names[curve_type]}無數據可匯出")
             return
         
-        file_path, _ = QFileDialog.getSaveFileName(self, f"匯出{curve_names[curve_type]}", curve.filename or f"{curve_type}_curve.txt", "文字檔案 (*.txt);;所有檔案 (*.*)")
+        default_filename = curve.filename or f"{curve_type}_curve.txt"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, f"匯出{curve_names[curve_type]}", 
+            default_filename, "文字檔案 (*.txt);;所有檔案 (*.*)"
+        )
         
         if file_path:
             if curve.save_to_file(file_path):
                 curve.filename = os.path.basename(file_path)
-                self.statusBar().showMessage(f"已匯出{curve_names[curve_type]}: {curve.filename}", 3000)
+                self.statusBar().showMessage(
+                    f"已匯出{curve_names[curve_type]}: {curve.filename}", 3000
+                )
             else:
                 QMessageBox.critical(self, "錯誤", "無法匯出檔案")
             

@@ -1,6 +1,7 @@
 # ================================================================================
 # 曲線計算服務 - calculation_service.py  
 # 處理曲線間的數學運算
+# 修正版：支援完整的三曲線計算關係
 # ================================================================================
 
 import numpy as np
@@ -47,7 +48,8 @@ class CurveCalculator:
     
     @staticmethod
     def add_curves(curve1, curve2):
-        """兩條曲線相加：curve1 + curve2"""
+        """兩條曲線相加：curve1 + curve2
+        主要用於：耳機響應 + EQ調整 = 目標曲線"""
         try:
             # 對齊頻率
             frequencies = CurveCalculator.align_frequencies(curve1, curve2)
@@ -72,7 +74,10 @@ class CurveCalculator:
     
     @staticmethod
     def subtract_curves(curve1, curve2):
-        """兩條曲線相減：curve1 - curve2"""
+        """兩條曲線相減：curve1 - curve2
+        主要用於：
+        - 目標曲線 - 耳機響應 = EQ調整
+        - 目標曲線 - EQ調整 = 耳機響應"""
         try:
             # 對齊頻率
             frequencies = CurveCalculator.align_frequencies(curve1, curve2)
@@ -95,9 +100,32 @@ class CurveCalculator:
             print(f"曲線相減錯誤: {e}")
             return None
     
+    # ========================================================================
+    # 新增：三曲線專用計算方法
+    # ========================================================================
+    
+    @staticmethod
+    def calculate_target_from_headphone_eq(headphone, eq):
+        """計算目標曲線：耳機響應 + EQ調整 = 目標曲線"""
+        return CurveCalculator.add_curves(headphone, eq)
+    
+    @staticmethod
+    def calculate_eq_from_target_headphone(target, headphone):
+        """計算EQ調整：目標曲線 - 耳機響應 = EQ調整"""
+        return CurveCalculator.subtract_curves(target, headphone)
+    
+    @staticmethod
+    def calculate_headphone_from_target_eq(target, eq):
+        """計算耳機響應：目標曲線 - EQ調整 = 耳機響應"""
+        return CurveCalculator.subtract_curves(target, eq)
+    
+    # ========================================================================
+    # 原有方法保持不變
+    # ========================================================================
+    
     @staticmethod
     def validate_curve_relationship(headphone, eq, target, tolerance=1.0):
-        """驗證三條曲線的數學關係：耳機 + EQ = 目標"""
+        """驗證三條曲線的數學關係：耳機響應 + EQ調整 = 目標曲線"""
         try:
             # 計算理論目標曲線
             calculated_target = CurveCalculator.add_curves(headphone, eq)
