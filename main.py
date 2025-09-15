@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # ================================================================================
-# 頻率響應曲線編輯器 - 修正版本
+# 頻率響應曲線編輯器 - 完整修復版本
 # 完整實現三曲線計算：耳機響應 + EQ調整 = 目標曲線
 # 每條曲線都有匯入/匯出按鈕
+# 修復：1. 清除功能 2. 新增數據點減少功能 3. 新增點擊添加點功能
 # ================================================================================
 
 import sys
@@ -10,7 +11,7 @@ import os
 import numpy as np
 import re
 from PyQt5.QtWidgets import *
-from PyQt5.QtCore import Qt, pyqtSignal, QObject, QDateTime
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QDateTime, QRect
 from PyQt5.QtGui import QFont, QMouseEvent
 import pyqtgraph as pg
 from scipy.interpolate import interp1d
@@ -19,7 +20,7 @@ from scipy.interpolate import interp1d
 from calculation_service import CurveCalculator
 
 # ================================================================================
-# 1. 數據處理工具 (FrequencyResponseData)
+# 1. 數據處理工具 (FrequencyResponseData) - 新增減少數據點功能和點編輯功能
 # ================================================================================
 
 class FrequencyResponseData(QObject):
@@ -115,6 +116,50 @@ class FrequencyResponseData(QObject):
             self.gains[index] = new_gain
             self.data_changed.emit()
             self.interpolate()
+    
+    def add_point(self, frequency, gain):
+        """在指定頻率添加新的數據點"""
+        if len(self.frequencies) == 0:
+            self.frequencies = np.array([frequency])
+            self.gains = np.array([gain])
+        else:
+            # 找到插入位置以保持頻率遞增
+            insert_index = np.searchsorted(self.frequencies, frequency)
+            
+            # 如果頻率已存在，更新增益值
+            if (insert_index < len(self.frequencies) and 
+                abs(self.frequencies[insert_index] - frequency) < 1.0):
+                self.gains[insert_index] = gain
+            else:
+                # 插入新點
+                self.frequencies = np.insert(self.frequencies, insert_index, frequency)
+                self.gains = np.insert(self.gains, insert_index, gain)
+        
+        self.data_changed.emit()
+        self.interpolate()
+        return True
+    
+    def remove_point(self, index):
+        """刪除指定索引的數據點"""
+        if 0 <= index < len(self.frequencies) and len(self.frequencies) > 1:
+            self.frequencies = np.delete(self.frequencies, index)
+            self.gains = np.delete(self.gains, index)
+            self.data_changed.emit()
+            self.interpolate()
+            return True
+        return False
+    
+    def get_point_at_frequency(self, frequency, tolerance=50):
+        """獲取指定頻率附近的點索引"""
+        if len(self.frequencies) == 0:
+            return None
+        
+        distances = np.abs(self.frequencies - frequency)
+        min_index = np.argmin(distances)
+        
+        if distances[min_index] <= tolerance:
+            return min_index
+        return None
 
     def interpolate(self, method='slinear'):
         """對數據進行插值"""
@@ -136,7 +181,7 @@ class FrequencyResponseData(QObject):
         self.is_interpolated = True
         self.data_changed.emit()
 
-    def clear(self):
+    def clear_data(self):
         """清空所有數據"""
         self.frequencies = np.array([])
         self.gains = np.array([])
@@ -145,9 +190,58 @@ class FrequencyResponseData(QObject):
         self.is_interpolated = False
         self.filename = None
         self.data_changed.emit()
+    
+    # ================================================================================
+    # 新增功能：減少數據點到關鍵頻率點
+    # ================================================================================
+    
+    def reduce_to_key_points(self):
+        """減少數據點到關鍵X軸座標點"""
+        if len(self.frequencies) == 0:
+            return False
+        
+        try:
+            # 定義關鍵頻率點（對應X軸主要刻度）
+            key_frequencies = [20, 50, 100, 200, 300, 500, 700, 1000, 2000, 3000, 5000, 7000, 10000, 12000, 15000, 18000, 20000]
+            
+            # 如果當前數據點已經很少，不進行減少
+            if len(self.frequencies) <= len(key_frequencies):
+                print("數據點已經較少，無需減少")
+                return False
+            
+            # 使用插值來計算關鍵頻率點的增益值
+            interp_func = interp1d(self.frequencies, self.gains, kind='linear', bounds_error=False, fill_value='extrapolate')
+            
+            # 過濾出在數據範圍內的關鍵頻率點
+            min_freq = self.frequencies[0]
+            max_freq = self.frequencies[-1]
+            filtered_key_freqs = [f for f in key_frequencies if min_freq <= f <= max_freq]
+            
+            # 確保包含20k點
+            if max_freq >= 20000 and 20000 not in filtered_key_freqs:
+                filtered_key_freqs.append(20000)
+            
+            # 計算新的增益值
+            new_gains = interp_func(filtered_key_freqs)
+            
+            # 更新數據
+            old_point_count = len(self.frequencies)
+            self.frequencies = np.array(filtered_key_freqs)
+            self.gains = new_gains
+            
+            # 重新插值
+            self.interpolate()
+            
+            print(f"數據點已減少：{old_point_count} → {len(self.frequencies)} 個點")
+            self.data_changed.emit()
+            return True
+            
+        except Exception as e:
+            print(f"減少數據點錯誤: {e}")
+            return False
 
 # ================================================================================
-# 2. 多曲線管理器 (MultiCurveManager)
+# 2. 多曲線管理器 (MultiCurveManager) - 修復清除功能
 # ================================================================================
 
 class MultiCurveManager(QObject):
@@ -216,9 +310,13 @@ class MultiCurveManager(QObject):
             old_auto = self.auto_calculate
             self.auto_calculate = False
             
+            # 使用關鍵點而不是插值密集點
             self.target_curve.frequencies = result['frequencies']
             self.target_curve.gains = result['gains']
             self.target_curve.is_interpolated = False
+            
+            # 減少到關鍵點
+            self.target_curve.reduce_to_key_points()
             self.target_curve.interpolate()
             
             self.auto_calculate = old_auto
@@ -237,6 +335,9 @@ class MultiCurveManager(QObject):
             self.eq_curve.frequencies = result['frequencies']
             self.eq_curve.gains = result['gains']
             self.eq_curve.is_interpolated = False
+            
+            # 減少到關鍵點
+            self.eq_curve.reduce_to_key_points()
             self.eq_curve.interpolate()
             
             self.auto_calculate = old_auto
@@ -255,6 +356,9 @@ class MultiCurveManager(QObject):
             self.headphone_curve.frequencies = result['frequencies']
             self.headphone_curve.gains = result['gains']
             self.headphone_curve.is_interpolated = False
+            
+            # 減少到關鍵點
+            self.headphone_curve.reduce_to_key_points()
             self.headphone_curve.interpolate()
             
             self.auto_calculate = old_auto
@@ -290,10 +394,10 @@ class MultiCurveManager(QObject):
         self.target_curve.data_changed.emit()
 
     def clear_all(self):
-        """清空所有曲線數據"""
-        self.headphone_curve.clear()
-        self.eq_curve.clear()
-        self.target_curve.clear()
+        """清空所有曲線數據 - 修復版"""
+        self.headphone_curve.clear_data()
+        self.eq_curve.clear_data()
+        self.target_curve.clear_data()
         self.last_modified = None
         self.curves_changed.emit()
 
@@ -308,7 +412,7 @@ class MultiCurveManager(QObject):
         }
 
 # ================================================================================
-# 3. 繪圖組件 (FrequencyPlotWidget)
+# 3. 繪圖組件 (FrequencyPlotWidget) - 新增完整的點編輯功能
 # ================================================================================
 
 class FrequencyPlotWidget(QWidget):
@@ -345,6 +449,26 @@ class FrequencyPlotWidget(QWidget):
         header_layout.addWidget(title_label)
         
         header_layout.addStretch()  # 推向右側
+        
+        # 減少數據點按鈕 - 新增
+        reduce_btn = QPushButton("精簡")
+        reduce_btn.setMaximumSize(50, 25)
+        reduce_btn.setToolTip("減少數據點到關鍵頻率")
+        reduce_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+                border: none;
+                border-radius: 3px;
+                font-size: 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #F57C00;
+            }
+        """)
+        reduce_btn.clicked.connect(self.reduce_data_points)
+        header_layout.addWidget(reduce_btn)
         
         # 匯入按鈕
         import_btn = QPushButton("匯入")
@@ -419,9 +543,36 @@ class FrequencyPlotWidget(QWidget):
         self.interpolated_line = None
         self.selected_point = None
         
+        # 設定滑鼠事件處理器
         self.plot_widget.mousePressEvent = self.mouse_press_event
         self.plot_widget.mouseMoveEvent = self.mouse_move_event
         self.plot_widget.mouseReleaseEvent = self.mouse_release_event
+        self.plot_widget.mouseDoubleClickEvent = self.mouse_double_click_event
+        self.plot_widget.contextMenuEvent = self.context_menu_event
+        
+    def reduce_data_points(self):
+        """減少數據點到關鍵頻率"""
+        if len(self.data.frequencies) == 0:
+            QMessageBox.warning(self, "警告", "沒有數據可以精簡")
+            return
+        
+        # 確認對話框
+        reply = QMessageBox.question(
+            self, '確認精簡', 
+            f'將數據點精簡到關鍵頻率點\n'
+            f'目前: {len(self.data.frequencies)} 個點\n'
+            f'精簡後約: 17 個關鍵點\n\n'
+            f'是否繼續？', 
+            QMessageBox.Yes | QMessageBox.No, 
+            QMessageBox.Yes
+        )
+        
+        if reply == QMessageBox.Yes:
+            success = self.data.reduce_to_key_points()
+            if success:
+                QMessageBox.information(self, "完成", f"已精簡至 {len(self.data.frequencies)} 個關鍵點")
+            else:
+                QMessageBox.information(self, "提示", "數據點已經較少，無需精簡")
         
     def setup_nonlinear_x_axis(self):
         """設定非線性X軸"""
@@ -490,20 +641,209 @@ class FrequencyPlotWidget(QWidget):
             )
             self.plot_item.addItem(self.selected_point)
     
+    # ================================================================================
+    # 新增的滑鼠事件處理方法
+    # ================================================================================
+    
     def mouse_press_event(self, event: QMouseEvent):
-        """滑鼠按下"""
+        """滑鼠按下 - 增強版支援新增點"""
+        if event.button() != Qt.LeftButton:
+            return
+            
+        pos = event.pos()
+        view_pos = self.plot_item.vb.mapDeviceToView(pos)
+        actual_freq = self.display_to_freq(view_pos.x())
+        
+        # 限制頻率範圍
+        actual_freq = max(20, min(20000, actual_freq))
+        gain = max(-20, min(20, view_pos.y()))
+        
+        if len(self.data.frequencies) == 0:
+            # 如果沒有數據，直接添加第一個點
+            self.data.add_point(actual_freq, gain)
+            self.selected_index = 0
+            self.update_plot()
+            self.point_selected.emit(self.selected_index)
+            return
+        
+# 尋找最近的數據點
+        self.selected_index = self.find_nearest_point(actual_freq, view_pos.y())
+        
+        if self.selected_index is not None:
+            # 點擊到現有數據點，進入拖拽模式
+            self.dragging = True
+            self.update_plot()
+            self.point_selected.emit(self.selected_index)
+        else:
+            # 點擊空白處，新增數據點
+            success = self.data.add_point(actual_freq, gain)
+            
+            if success:
+                # 找到新添加的點的索引
+                new_index = self.data.get_point_at_frequency(actual_freq)
+                if new_index is not None:
+                    self.selected_index = new_index
+                    self.dragging = True
+                    self.update_plot()
+                    self.point_selected.emit(self.selected_index)
+    
+    def mouse_double_click_event(self, event: QMouseEvent):
+        """雙擊事件 - 精確編輯數據點"""
         if event.button() != Qt.LeftButton or len(self.data.frequencies) == 0:
             return
             
         pos = event.pos()
         view_pos = self.plot_item.vb.mapDeviceToView(pos)
         actual_freq = self.display_to_freq(view_pos.x())
-        self.selected_index = self.find_nearest_point(actual_freq, view_pos.y())
         
-        if self.selected_index is not None:
-            self.dragging = True
+        point_index = self.find_nearest_point(actual_freq, view_pos.y())
+        if point_index is not None:
+            self.edit_point_dialog(point_index)
+    
+    def context_menu_event(self, event):
+        """右鍵選單"""
+        pos = event.pos()
+        view_pos = self.plot_item.vb.mapDeviceToView(pos)
+        actual_freq = self.display_to_freq(view_pos.x())
+        
+        menu = QMenu(self)
+        
+        if len(self.data.frequencies) > 0:
+            point_index = self.find_nearest_point(actual_freq, view_pos.y())
+            
+            if point_index is not None:
+                # 右鍵點在數據點上
+                freq = self.data.frequencies[point_index]
+                gain = self.data.gains[point_index]
+                
+                menu.addAction(f"數據點: {freq:.0f}Hz, {gain:+.2f}dB").setEnabled(False)
+                menu.addSeparator()
+                
+                edit_action = menu.addAction("編輯數值")
+                edit_action.triggered.connect(lambda: self.edit_point_dialog(point_index))
+                
+                if len(self.data.frequencies) > 1:  # 至少保留一個點
+                    delete_action = menu.addAction("刪除此點")
+                    delete_action.triggered.connect(lambda: self.delete_point(point_index))
+                
+            else:
+                # 右鍵點在空白處
+                actual_freq = max(20, min(20000, actual_freq))
+                gain = max(-20, min(20, view_pos.y()))
+                
+                add_action = menu.addAction(f"在此添加點 ({actual_freq:.0f}Hz)")
+                add_action.triggered.connect(lambda: self.add_point_at_position(actual_freq, gain))
+        else:
+            # 沒有數據點
+            actual_freq = max(20, min(20000, actual_freq))
+            gain = max(-20, min(20, view_pos.y()))
+            
+            add_action = menu.addAction(f"添加第一個點 ({actual_freq:.0f}Hz)")
+            add_action.triggered.connect(lambda: self.add_point_at_position(actual_freq, gain))
+        
+        menu.addSeparator()
+        
+        # 通用選項
+        if len(self.data.frequencies) > 0:
+            reduce_action = menu.addAction("精簡數據點")
+            reduce_action.triggered.connect(self.reduce_data_points)
+            
+            clear_action = menu.addAction("清空所有點")
+            clear_action.triggered.connect(self.clear_all_points)
+        
+        menu.exec_(event.globalPos())
+    
+    def edit_point_dialog(self, index):
+        """編輯數據點對話框"""
+        if not (0 <= index < len(self.data.frequencies)):
+            return
+            
+        freq = self.data.frequencies[index]
+        gain = self.data.gains[index]
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("編輯數據點")
+        dialog.setModal(True)
+        dialog.resize(300, 120)
+        
+        layout = QFormLayout(dialog)
+        
+        freq_spin = QDoubleSpinBox()
+        freq_spin.setRange(20, 20000)
+        freq_spin.setValue(freq)
+        freq_spin.setSuffix(" Hz")
+        
+        gain_spin = QDoubleSpinBox()
+        gain_spin.setRange(-20, 20)
+        gain_spin.setValue(gain)
+        gain_spin.setSuffix(" dB")
+        gain_spin.setSingleStep(0.1)
+        
+        layout.addRow("頻率:", freq_spin)
+        layout.addRow("增益:", gain_spin)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            new_freq = freq_spin.value()
+            new_gain = gain_spin.value()
+            
+            # 刪除舊點
+            self.data.remove_point(index)
+            # 添加新點
+            self.data.add_point(new_freq, new_gain)
+            
+            # 更新選中索引
+            self.selected_index = self.data.get_point_at_frequency(new_freq)
             self.update_plot()
-            self.point_selected.emit(self.selected_index)
+    
+    def add_point_at_position(self, freq, gain):
+        """在指定位置添加點"""
+        success = self.data.add_point(freq, gain)
+        if success:
+            new_index = self.data.get_point_at_frequency(freq)
+            if new_index is not None:
+                self.selected_index = new_index
+                self.update_plot()
+                self.point_selected.emit(self.selected_index)
+    
+    def delete_point(self, index):
+        """刪除數據點"""
+        if len(self.data.frequencies) <= 1:
+            QMessageBox.warning(self, "警告", "至少需要保留一個數據點")
+            return
+            
+        reply = QMessageBox.question(
+            self, '確認刪除', 
+            f'確定要刪除數據點嗎？\n'
+            f'頻率: {self.data.frequencies[index]:.0f}Hz\n'
+            f'增益: {self.data.gains[index]:+.2f}dB', 
+            QMessageBox.Yes | QMessageBox.No, 
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            success = self.data.remove_point(index)
+            if success:
+                self.selected_index = None
+                self.update_plot()
+    
+    def clear_all_points(self):
+        """清空所有數據點"""
+        reply = QMessageBox.question(
+            self, '確認清空', 
+            '確定要清空所有數據點嗎？', 
+            QMessageBox.Yes | QMessageBox.No, 
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.data.clear_data()
+            self.selected_index = None
+            self.update_plot()
     
     def mouse_move_event(self, event: QMouseEvent):
         """滑鼠移動"""
@@ -777,9 +1117,6 @@ class FrequencyResponseEditor(QMainWindow):
         self.eq_plot.update_plot()
         self.target_plot.update_plot()
         
-    def on_point_selected(self, index, curve_type):
-        """點被選中"""
-        curve = self.curve_manager.get_curve(curve_type)
     def on_point_selected(self, index, curve_type):
         """點被選中"""
         curve = self.curve_manager.get_curve(curve_type)
